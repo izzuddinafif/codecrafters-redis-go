@@ -85,16 +85,14 @@ func handleConnection(conn net.Conn) {
 		case bytes.Contains(msg, []byte("ECHO")):
 			str := bytes.Fields(msg)
 			d.printf("Parsed strings: %q", str)
-			var idx int
+			var data []byte
 			for i, v := range str {
-				if bytes.Equal(v, []byte("ECHO")) {
-					idx = i + 2
+				if bytes.Equal(v, []byte("ECHO")) && i+1 < len(str) {
+					data = str[i+2]
 					break
 				}
-				idx = -1
 			}
-			len := len(str[idx])
-			resp := fmt.Sprintf("$%d\r\n%s\r\n", len, str[idx])
+			resp := fmt.Sprintf("$%d\r\n%s\r\n", len(data), data)
 			d.print("Writing response: ", resp)
 			_, err := conn.Write([]byte(resp))
 			if err != nil {
