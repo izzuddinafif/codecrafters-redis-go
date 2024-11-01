@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -77,7 +78,29 @@ func handleConnection(conn net.Conn) {
 		switch {
 		case bytes.Contains(msg, []byte("PING")):
 			_, err := conn.Write([]byte("+PONG\r\n"))
-			handleError(err, "Error writing PONG response")
+			if err != nil {
+				handleError(err, "Error writing PONG response")
+				return
+			}
+		case bytes.Contains(msg, []byte("ECHO")):
+			str := bytes.Fields(msg)
+			d.printf("Parsed strings: %q", str)
+			var idx int
+			for i, v := range str {
+				if bytes.Equal(v, []byte("ECHO")) {
+					idx = i + 2
+					break
+				}
+				idx = -1
+			}
+			len := len(str[idx])
+			resp := fmt.Sprintf("$%d\r\n%s\r\n", len, str[idx])
+			d.print("Writing response: ", resp)
+			_, err := conn.Write([]byte(resp))
+			if err != nil {
+				handleError(err, "Error writing ECHO response")
+				return
+			}
 		}
 	}
 }
