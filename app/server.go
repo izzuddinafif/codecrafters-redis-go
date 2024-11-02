@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -26,8 +27,58 @@ func (d debugger) printf(format string, a ...interface{}) {
 	}
 }
 
-var dict map[string]string = make(map[string]string, 0)
-var exp map[string]int64 = make(map[string]int64, 0)
+type RedisDB struct {
+	dict   map[string]string
+	expiry map[string]int64
+}
+
+func newRedisDB() *RedisDB {
+	return &RedisDB{
+		dict:   make(map[string]string),
+		expiry: make(map[string]int64),
+	}
+}
+
+func (db *RedisDB) set(key, value string, expiryMillis int64) {
+	db.dict[key] = value
+	if expiryMillis > 0 {
+		db.expiry[key] = time.Now().UnixMilli() + expiryMillis
+		d.printf("Key %q set with expiry in %d milliseconds", key, expiryMillis)
+	} else {
+		delete(db.expiry, key) // remove residual expiry key (if exists)
+	}
+}
+
+func (db *RedisDB) get(key string) (string, bool) {
+	if db.isExpired(key) {
+		delete(db.dict, key)
+		delete(db.expiry, key)
+		return "", false
+	}
+	value, exists := db.dict[key]
+	return value, exists
+}
+
+func (db *RedisDB) isExpired(key string) bool {
+	expiry, exists := db.expiry[key]
+	return exists && time.Now().UnixMilli() > expiry
+}
+
+type config struct {
+	dir        string
+	dbfilename string
+}
+
+func (conf config) configGet(param string) string {
+	switch param {
+	case "dir":
+		return conf.dir
+	case "dbfilename":
+		return conf.dbfilename
+	default:
+		return "-ERR unknown parameter\r\n"
+	}
+}
 
 var d debugger = debugger{enabled: false}
 
@@ -49,14 +100,16 @@ func contains(sb []byte, s string) bool {
 	return bytes.Contains(bytes.ToLower(sb), bytes.ToLower([]byte(s)))
 }
 
-// Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
-var _ = net.Listen
-var _ = os.Exit
-
 func main() {
 	d.enabled = true
 
-	d.printf("Starting Afif's redis server on port %d", 6379)
+	db := newRedisDB()
+	conf := config{} // Create a config instance and parse the values from command-line flags
+	flag.StringVar(&conf.dir, "dir", "/tmp/redis-data", "Directory for RDB file storage")
+	flag.StringVar(&conf.dbfilename, "dbfilename", "dump.rdb", "RDB file name")
+	flag.Parse()
+
+	d.printf("Server started with dir=%s, dbfilename=%s\n", conf.dir, conf.dbfilename)
 
 	l, err := net.Listen("tcp", ":6379")
 	handleError(err, "Failed to bind to port 6379")
@@ -71,11 +124,11 @@ func main() {
 			continue
 		}
 		d.print("Accepting connection from: ", conn.RemoteAddr())
-		go handleConnection(conn)
+		go handleConnection(conn, db, conf) // TODO: synchronize goroutines when modifying db
 	}
 }
 
-func handleConnection(conn net.Conn) {
+func handleConnection(conn net.Conn, db *RedisDB, conf config) {
 	defer conn.Close()
 	buf := make([]byte, 1024)
 
@@ -88,110 +141,64 @@ func handleConnection(conn net.Conn) {
 		msg := buf[:n]
 		d.printf("Message read: %q, message length: %d", msg, len(msg))
 
+		str := bytes.Fields(msg)
+		d.printf("Parsed strings: %q", str)
+		if len(str) < 2 {
+			conn.Write([]byte("-ERR incomplete command"))
+			return
+		}
+
 		switch {
-		case contains(msg, "PING"):
-			_, err := conn.Write([]byte("+PONG\r\n"))
-			if err != nil {
-				handleError(err, "Error writing PONG response")
-				return
-			}
-		case contains(msg, "ECHO"):
-			str := bytes.Fields(msg)
-			d.printf("Parsed strings: %q", str)
-			var data []byte
-			for i, v := range str {
-				if equal(v, "ECHO") && i+2 < len(str) {
-					data = str[i+2]
-					break
-				}
-			}
+		case contains(str[2], "PING"):
+			conn.Write([]byte("+PONG\r\n"))
+		case contains(str[2], "ECHO"):
+			data := str[4]
 			resp := fmt.Sprintf("$%d\r\n%s\r\n", len(data), data)
-			d.print("Writing response: ", resp)
-			_, err := conn.Write([]byte(resp))
-			if err != nil {
-				handleError(err, "Error writing ECHO response")
+			conn.Write([]byte(resp))
+		case contains(str[2], "SET"):
+			if len(str) < 6 || !equal(str[2], "SET") {
+				conn.Write([]byte("-ERR invalid SET command\r\n"))
 				return
 			}
-		case contains(msg, "SET"):
-			var t int
-			var px bool
-			str := bytes.Fields(msg)
-			d.printf("Parsed strings: %q", str)
-			var key, value string
-			for i, v := range str {
-				if equal(v, "SET") && i+4 < len(str) {
-					key = string(str[i+2])
-					value = string(str[i+4])
-					if i+8 < len(str) && equal(str[i+6], "PX") {
-						px = true
-						t, err = strconv.Atoi(string(str[i+8]))
-						if err != nil {
-							handleError(err, "Error converting string to int")
-							return
-						}
-					}
-					break
-				}
-			}
-			dict[key] = value
-			if px {
-				exp[key] = time.Now().UnixMilli() + int64(t)
-			}
-			d.printf("Value %q is written to key %q", value, key)
-			if px {
-				d.printf("Key expiration in %d milliseconds", t)
-			}
-			_, err := conn.Write([]byte("+OK\r\n"))
-			if err != nil {
-				handleError(err, "Invalid command")
-				return
-			}
-		case contains(msg, "GET"):
-			str := bytes.Fields(msg)
-			d.printf("Parsed strings: %q", str)
-			var key string
-			for i, v := range str {
-				if equal(v, "GET") && i+2 < len(str) {
-					key = string(str[i+2])
-					break
-				}
-			}
-			if value, ok := dict[key]; !ok {
-				d.printf("Key %q does not exist!", key)
-				_, err := conn.Write([]byte("$-1\r\n"))
-				if err != nil {
-					handleError(err, "Error writing nil response")
+			key, value := string(str[4]), string(str[6])
+			expirymillis := int64(0)
+			if len(str) > 10 && equal(str[8], "PX") {
+				if t, err := strconv.Atoi(string(str[10])); err == nil {
+					d.printf("Expiry time is in %d milliseconds", t)
+					expirymillis = int64(t)
+				} else {
+					conn.Write([]byte("-ERR invalid expiration time\r\n"))
 					return
 				}
-			} else {
-				if expiry, ok := exp[key]; ok {
-					if expiry <= time.Now().UnixMilli() {
-						d.printf("Key %q has expired!", key)
-						delete(dict, key)
-						delete(exp, key)
-						_, err := conn.Write([]byte("$-1\r\n"))
-						if err != nil {
-							handleError(err, "Error writing nil response")
-							return
-						}
-						return
-					}
-				}
-				d.printf("Sending resp for %q key: %q value", key, value)
-				len := len(value)
-				resp := fmt.Sprintf("$%d\r\n%s\r\n", len, value)
-				_, err := conn.Write([]byte(resp))
-				if err != nil {
-					handleError(err, "Error writing value response")
-				}
 			}
+			db.set(key, value, expirymillis)
+			conn.Write([]byte("+OK\r\n"))
+		case contains(str[2], "GET"):
+			if len(str) < 4 {
+				conn.Write([]byte("-ERR invalid GET command\r\n"))
+				return
+			}
+			key := string(str[4])
+			if value, exists := db.get(key); exists {
+				d.printf("Sending resp for %q key: %q value", key, value)
+				resp := fmt.Sprintf("$%d\r\n%s\r\n", len(value), value)
+				conn.Write([]byte(resp))
+			} else {
+				d.printf("Key %q does not exist!", key)
+				conn.Write([]byte("$-1\r\n"))
+			}
+		case contains(str[2], "CONFIG"):
+			if len(str) < 6 {
+				conn.Write([]byte("-ERR invalid CONFIG command\r\n"))
+				return
+			}
+			param := string(str[6])
+			result := conf.configGet(param)
+			resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(param), param, len(result), result)
+			conn.Write([]byte(resp))
 		default:
 			d.print("Invalid or incomplete command")
-			_, err := conn.Write([]byte("-ERR invalid command\r\n"))
-			if err != nil {
-				handleError(err, "Error writing ERR response")
-			}
-			return
+			conn.Write([]byte("-ERR invalid command\r\n"))
 		}
 	}
 }
