@@ -24,6 +24,8 @@ func (d debugger) printf(format string, a ...interface{}) {
 	}
 }
 
+var dict map[string]string = make(map[string]string, 0)
+
 var d debugger = debugger{enabled: false}
 
 func handleError(err error, msg string) {
@@ -99,6 +101,56 @@ func handleConnection(conn net.Conn) {
 				handleError(err, "Error writing ECHO response")
 				return
 			}
+		case bytes.Contains(msg, []byte("SET")):
+			str := bytes.Fields(msg)
+			d.printf("Parsed strings: %q", str)
+			var key, value string
+			for i, v := range str {
+				if bytes.Equal(v, []byte("SET")) && i+4 < len(str) {
+					key = string(str[i+2])
+					value = string(str[i+4])
+					break
+				}
+			}
+			dict[key] = value
+			d.printf("Value %s is written to key %s", value, key)
+			_, err := conn.Write([]byte("+OK\r\n"))
+			if err != nil {
+				handleError(err, "Invalid command")
+				return
+			}
+		case bytes.Contains(msg, []byte("GET")):
+			str := bytes.Fields(msg)
+			d.printf("Parsed strings: %q", str)
+			var key string
+			for i, v := range str {
+				if bytes.Equal(v, []byte("GET")) && i+2 < len(str) {
+					key = string(str[i+2])
+					break
+				}
+			}
+			if value, ok := dict[key]; !ok {
+				d.printf("Key %s does not exist!", key)
+				_, err := conn.Write([]byte("$-1\r\n"))
+				if err != nil {
+					handleError(err, "Error writing nil response")
+					return
+				}
+			} else {
+				len := len(value)
+				resp := fmt.Sprintf("$%d\r\n%s\r\n", len, value)
+				_, err := conn.Write([]byte(resp))
+				if err != nil {
+					handleError(err, "Error writing value response")
+				}
+			}
+		default:
+			d.print("Invalid or incomplete command")
+			_, err := conn.Write([]byte("-ERR invalid command\r\n"))
+			if err != nil {
+				handleError(err, "Error writing ERR response")
+			}
+			return
 		}
 	}
 }
