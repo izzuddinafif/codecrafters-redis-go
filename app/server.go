@@ -7,7 +7,10 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -109,6 +112,13 @@ func main() {
 	flag.StringVar(&conf.dbfilename, "dbfilename", "dump.rdb", "RDB file name")
 	flag.Parse()
 
+	f, err := os.Open(filepath.Join(conf.dir, conf.dbfilename))
+	if err != nil {
+		d.print("Failed to open file: ", err)
+		f = nil
+		d.print("Database is empty")
+	}
+
 	d.printf("Server started with dir=%s, dbfilename=%s\n", conf.dir, conf.dbfilename)
 
 	l, err := net.Listen("tcp", ":6379")
@@ -124,11 +134,11 @@ func main() {
 			continue
 		}
 		d.print("Accepting connection from: ", conn.RemoteAddr())
-		go handleConnection(conn, db, conf) // TODO: synchronize goroutines when modifying db
+		go handleConnection(conn, db, conf, f) // TODO: synchronize goroutines when modifying db
 	}
 }
 
-func handleConnection(conn net.Conn, db *RedisDB, conf config) {
+func handleConnection(conn net.Conn, db *RedisDB, conf config, f *os.File) {
 	defer conn.Close()
 	buf := make([]byte, 1024)
 
@@ -196,6 +206,55 @@ func handleConnection(conn net.Conn, db *RedisDB, conf config) {
 			result := conf.configGet(param)
 			resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(param), param, len(result), result)
 			conn.Write([]byte(resp))
+		case contains(str[2], "KEYS"):
+			pattern := string(str[4])
+			if pattern == "*" { // handle glob pattern
+				pattern = strings.ReplaceAll(pattern, "*", ".*")
+			}
+			r := regexp.MustCompile(pattern)
+
+			content := make([]byte, 4096)
+			_, err := f.Read(content)
+			handleError(err, "Failed to read file content")
+			htIdx := bytes.IndexByte(content, 0xFB)
+			end := bytes.IndexByte(content, 0xFF)
+			d.print("index hash table ", htIdx, content[htIdx+1])
+			start := htIdx + 3 // skipping hash table size and n of keys with expiry
+			content = content[start:end]
+			if content[0] == 0x00 { // skipping the first 0x00
+				content = content[1:]
+			}
+			kvPairs := bytes.Split(content, []byte{0x00}) // assuming all the values are strings
+			d.print(kvPairs)
+			keys := make([][]byte, len(kvPairs))
+			for _, kv := range kvPairs {
+				d.print("inspecting key-value pair: ", string(kv))
+				sizeEnc := kv[0]        // still assuming all the values are strings
+				check := sizeEnc & 0xC0 // isolate the first 2 bits by using bitwise AND with 0b11000000 (0xC0)
+				switch {
+				case check == 0x00: // the size is in the lower 6 bits of the byte
+					idx := int(sizeEnc) + 1
+					keys = append(keys, kv[1:idx])
+				case check == 0x40: // 14 bit size, 6 bits of this byte + next byte included
+				case check == 0x80: // 4 byte big endian size
+				case check == 0xC0: // special str enc
+				}
+			}
+			var results [][]byte
+			for _, key := range keys {
+				found := r.Find(key)
+				if found != nil {
+					d.print("found key: ", string(found))
+					results = append(results, found)
+				}
+			}
+			resp := []byte("*" + strconv.Itoa(len(results)) + "\r\n")
+			for _, result := range results {
+				resp = append(resp, []byte("$"+strconv.Itoa(len(result))+"\r\n"+string(result)+"\r\n")...)
+			}
+			d.print("sending response: ", string(resp))
+			conn.Write(resp)
+
 		default:
 			d.print("Invalid or incomplete command")
 			conn.Write([]byte("-ERR invalid command\r\n"))
